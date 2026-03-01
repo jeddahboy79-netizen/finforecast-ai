@@ -1,15 +1,220 @@
-# Updated app.py
-
-# Import necessary libraries
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import requests
+from datetime import datetime
+from io import BytesIO
+from polygon import RESTClient
+from edgar import set_identity
+from edgartools import Company
 import os
 
-# Define your function and structure it correctly here
+st.set_page_config(page_title="FinForecast AI", layout="wide")
+st.title("FinForecast AI - Smart Financial Forecasting Tool")
 
-def main():
-    # Your main program logic should go here
-    pass
+def get_ticker(query):
+    """Convert company name or ticker to stock ticker symbol"""
+    if any(x in query.upper() for x in [".SR", ".T", ".L"]) or query.isupper() or query.replace(".", "").isdigit():
+        return query.upper()
+    try:
+        data = yf.utils.get_json("https://query1.finance.yahoo.com/v1/finance/search", params={"q": query, "quotesCount": 1}, user_agent="Mozilla/5.0")
+        return data["quotes"][0]["symbol"]
+    except:
+        return query.upper()
 
-# Please make sure to configure your environment variables for any sensitive data, such as API keys
+@st.cache_data(ttl=3600)
+def fetch_financials(ticker, fmp_key, sah_mk_key, polygon_key, edgar_email):
+    """Fetch financial data from multiple sources with priority order"""
+    
+    # Priority 1: FMP (best for most stocks)
+    if fmp_key:
+        try:
+            url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?limit=12&period=annual&apikey={fmp_key}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    df = pd.DataFrame(data)[['date', 'revenue', 'operatingIncome', 'netIncome', 'eps']]
+                    df['Year'] = pd.to_datetime(df['date']).dt.year
+                    df = df.rename(columns={'revenue':'Revenue', 'operatingIncome':'Operating Income', 'netIncome':'Net Income', 'eps':'EPS'})
+                    return df[['Year', 'Revenue', 'Operating Income', 'Net Income', 'EPS']].sort_values('Year')
+        except:
+            pass
 
-if __name__ == '__main__':
-    main()
+    # Priority 2: SAHMK (for Saudi .SR stocks)
+    if sah_mk_key and ticker.endswith('.SR'):
+        try:
+            symbol = ticker.replace('.SR', '')
+            url = f"https://app.sahmk.sa/api/v1/financials/{symbol}/"
+            headers = {'X-API-Key': sah_mk_key}
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                inc = data.get('income_statements', [])
+                df = pd.DataFrame(inc)
+                df['Year'] = pd.to_datetime(df['report_date']).dt.year
+                df = df.rename(columns={'total_revenue':'Revenue', 'operating_income':'Operating Income', 'net_income':'Net Income'})
+                if 'eps' in df.columns:
+                    df = df.rename(columns={'eps':'EPS'})
+                return df[['Year', 'Revenue', 'Operating Income', 'Net Income', 'EPS' if 'EPS' in df else 'Net Income']].sort_values('Year')
+        except:
+            pass
+
+    # Priority 3: EDGAR (US stocks only)
+    if not ticker.endswith('.SR') and '@' in edgar_email:
+        try:
+            set_identity(f"FinForecast AI {edgar_email}")
+            company = Company(ticker)
+            financials = company.get_financials()
+            inc = financials.income_statement()
+            if not inc.empty:
+                inc = inc.reset_index()
+                inc['Year'] = pd.to_datetime(inc['date']).dt.year
+                return inc[['Year', 'revenue', 'operating_income', 'net_income', 'eps']].rename(columns={
+                    'revenue': 'Revenue', 'operating_income': 'Operating Income', 'net_income': 'Net Income', 'eps': 'EPS'
+                })
+        except:
+            pass
+
+    # Priority 4: Polygon
+    if polygon_key:
+        try:
+            client = RESTClient(polygon_key)
+            financials = list(client.vx.list_stock_financials(ticker=ticker, timeframe="annual", limit=12))
+            data = []
+            for f in financials:
+                inc = f.financials.income_statement
+                data.append({
+                    "Year": f.fiscal_year,
+                    "Revenue": getattr(inc.revenues, "value", None),
+                    "Operating Income": getattr(inc.operating_income_loss, "value", None),
+                    "Net Income": getattr(inc.net_income_loss, "value", None),
+                    "EPS": getattr(inc.basic_earnings_per_share, "value", None)
+                })
+            df = pd.DataFrame(data).dropna(how="all")
+            return df.sort_values("Year")
+        except:
+            pass
+
+    # Fallback: yfinance
+    try:
+        stock = yf.Ticker(ticker)
+        income = stock.income_stmt.T
+        if not income.empty:
+            df = pd.DataFrame({
+                "Year": pd.to_datetime(income.index).year,
+                "Revenue": income.get("Total Revenue"),
+                "Operating Income": income.get("Operating Income"),
+                "Net Income": income.get("Net Income"),
+                "EPS": income.get("Diluted EPS")
+            }).dropna(how="all")
+            return df.sort_values("Year")
+    except:
+        pass
+
+    return pd.DataFrame()
+
+# Sidebar configuration
+with st.sidebar:
+    query = st.text_input("Company Name or Ticker", "AAPL")
+    ticker = get_ticker(query)
+    forecast_years = st.slider("Forecast Years", 3, 10, 5)
+    
+    st.subheader("API Keys (Optional - Priority Order)")
+    st.info("Use environment variables or Streamlit secrets for API keys")
+    
+    # Get API keys from environment variables or Streamlit secrets
+    fmp_key = os.getenv("FMP_API_KEY", st.secrets.get("fmp_api_key", ""))
+    sah_mk_key = os.getenv("SAHMK_API_KEY", st.secrets.get("sahmk_api_key", ""))
+    polygon_key = os.getenv("POLYGON_API_KEY", st.secrets.get("polygon_api_key", ""))
+    edgar_email = os.getenv("EDGAR_EMAIL", st.secrets.get("edgar_email", "your.email@example.com"))
+
+# Main content
+if st.sidebar.button("Run Analysis", type="primary") or "data_loaded" in st.session_state:
+    try:
+        hist_df = fetch_financials(ticker, fmp_key, sah_mk_key, polygon_key, edgar_email)
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        name = info.get("longName", ticker)
+        st.success(f"Loaded: **{name}** ({ticker})")
+
+        tabs = st.tabs(["Historical", "Forecast Scenarios", "Advanced DCF", "Monte Carlo", "Industry & Analysts"])
+
+        with tabs[0]:
+            st.subheader("Historical Financials")
+            if not hist_df.empty:
+                st.dataframe(hist_df.style.format({"Revenue": "{:,.0f}", "Operating Income": "{:,.0f}", "Net Income": "{:,.0f}", "EPS": "{:.2f}"}))
+
+        with tabs[1]:
+            st.subheader("Forecast Scenarios (Base / Optimistic / Pessimistic)")
+            base_growth = st.slider("Base Growth Rate (%)", 0, 30, 10) / 100
+            opt_growth = st.slider("Optimistic Growth Rate (%)", 0, 40, 18) / 100
+            pes_growth = st.slider("Pessimistic Growth Rate (%)", -10, 15, 3) / 100
+            margin = st.slider("Operating Margin (%)", 5, 60, 25)
+            tax = st.slider("Tax Rate (%)", 0, 40, 25)
+            
+            last_rev = hist_df["Revenue"].iloc[-1] if not hist_df.empty else 1_000_000_000
+            scenarios = {}
+            for scenario, growth in [("Base", base_growth), ("Optimistic", opt_growth), ("Pessimistic", pes_growth)]:
+                proj = []
+                for i in range(1, forecast_years + 1):
+                    rev = last_rev * (1 + growth) ** i
+                    op = rev * (margin / 100)
+                    net = op * (1 - tax / 100)
+                    eps = net / (info.get("sharesOutstanding", 1_000_000_000) * 1.01 ** i)
+                    proj.append({"Year": datetime.now().year + i, "Revenue": rev, "EPS": eps, "Net Profit": net})
+                scenarios[scenario] = pd.DataFrame(proj)
+            
+            combined = pd.concat([df.assign(Scenario=scen) for scen, df in scenarios.items()])
+            fig_rev = px.line(combined, x="Year", y="Revenue", color="Scenario", title="Revenue Forecast Comparison")
+            fig_eps = px.line(combined, x="Year", y="EPS", color="Scenario", title="EPS Forecast Comparison")
+            st.plotly_chart(fig_rev, use_container_width=True)
+            st.plotly_chart(fig_eps, use_container_width=True)
+            
+            for scen, df in scenarios.items():
+                st.subheader(f"{scen} Scenario")
+                st.dataframe(df.style.format({"Revenue": "{:,.0f}", "EPS": "{:.2f}", "Net Profit": "{:,.0f}"}))
+
+        with tabs[2]:
+            st.subheader("Advanced DCF")
+            wacc = st.slider("WACC (%)", 6.0, 15.0, 9.5, 0.1) / 100
+            g = st.slider("Terminal Growth (%)", 1.0, 5.0, 3.0, 0.1) / 100
+            fcf = scenarios["Base"]["Net Profit"].iloc[-1] * 0.85
+            dcf = sum([fcf * (1 + g) ** i / (1 + wacc) ** i for i in range(1, forecast_years + 1)])
+            tv = fcf * (1 + g) / (wacc - g) / (1 + wacc) ** forecast_years
+            fair_price = (dcf + tv) / info.get("sharesOutstanding", 1_000_000_000)
+            current = info.get("currentPrice", info.get("regularMarketPrice", 0))
+            st.metric("Fair Value (DCF)", f"{fair_price:,.2f}", f"{(fair_price / current - 1) * 100:+.1f}%")
+
+        with tabs[3]:
+            st.subheader("Monte Carlo Simulation (10,000 runs)")
+            if st.button("Run Simulation"):
+                sims = 10000
+                growth_sim = np.random.normal(base_growth, 0.06, sims)
+                prices = [current * (1 + gr) ** forecast_years for gr in growth_sim]
+                fig = px.histogram(prices, nbins=100, title="Fair Price Distribution")
+                st.plotly_chart(fig)
+                st.success(f"Probability of price increase: {(np.array(prices) > current).mean() * 100 :.1f}%")
+
+        with tabs[4]:
+            st.subheader("Industry & Analyst Data")
+            st.metric("Analyst Target Price", f"{info.get('targetMeanPrice', 'N/A')}")
+            st.metric("Recommendation", info.get("recommendationKey", "N/A").upper())
+            st.caption(f"Sector: {info.get('sector')} | Industry: {info.get('industry')}")
+
+        # Excel export
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            hist_df.to_excel(writer, sheet_name="Historical", index=False)
+            for scen, df in scenarios.items():
+                df.to_excel(writer, sheet_name=f"{scen}_Forecast", index=False)
+        st.download_button("Download Full Excel Report", output.getvalue(), f"{ticker}_Forecast_Report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        st.session_state.data_loaded = True
+
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+
+st.caption("FinForecast AI - Smart Financial Forecasting Tool | All API keys should be stored securely using environment variables or Streamlit secrets")
